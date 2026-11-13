@@ -54,29 +54,34 @@ def process_landmarks_to_tensor(landmarks):
     return centered_coords
 
 def main():
-    # Inicializa o modelo de classificação de tênis
+    device = 'cuda' if (HAS_TORCH and torch.cuda.is_available()) else 'cpu'
     tennis_model = TennisTransformerGPU()
     if HAS_TORCH:
-        tennis_model = tennis_model.to('cuda')
+        tennis_model = tennis_model.to(device)
     
     # Caminho para o modelo MediaPipe
     model_path = os.path.join(BASE_DIR, 'pose_landmarker_lite.task')
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE)
+        running_mode=vision.RunningMode.VIDEO)
     landmarker = vision.PoseLandmarker.create_from_options(options)
 
-    # Inicia a captura de vídeo
-    cap = cv2.VideoCapture(1)
+    # Inicia a captura de vídeo com DirectShow e FourCC MJPG
+    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
         cap = cv2.VideoCapture(0)
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     pTime = 0
+    mp_ts_ms = 0
     
     # Buffer de frames deslizante (60 frames max)
     frame_buffer = collections.deque(maxlen=60)
@@ -120,24 +125,29 @@ def main():
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
 
-        # Inferência do MediaPipe
-        detection_result = landmarker.detect(mp_image)
+        # Inferência do MediaPipe em modo VIDEO
+        ts_ms = int(cTime * 1000)
+        if ts_ms <= mp_ts_ms:
+            ts_ms = mp_ts_ms + 1
+        mp_ts_ms = ts_ms
 
-        annotated_image = np.copy(frame)
+        detection_result = landmarker.detect_for_video(mp_image, ts_ms)
+        annotated_image = frame
         
         if detection_result.pose_landmarks:
-            pose_landmark_style = drawing_styles.get_default_pose_landmarks_style()
-            
-            # Trabalha com o primeiro pose detectado (assumindo 1 jogador)
             landmarks = detection_result.pose_landmarks[0]
             
-            # Desenhar no frame
-            drawing_utils.draw_landmarks(
-                image=annotated_image,
-                landmark_list=landmarks,
-                connections=vision.PoseLandmarksConnections.POSE_LANDMARKS,
-                landmark_drawing_spec=pose_landmark_style
-            )
+            # Desenho direto no frame sem cópia completa de imagem
+            h, w = annotated_image.shape[:2]
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+            CONNS = ((11, 12), (11, 23), (12, 24), (23, 24), (11, 13), (13, 15),
+                     (12, 14), (14, 16), (23, 25), (25, 27), (24, 26), (26, 28))
+            for p1, p2 in CONNS:
+                if p1 < len(pts) and p2 < len(pts):
+                    cv2.line(annotated_image, pts[p1], pts[p2], (0, 255, 128), 2)
+            for idx in (11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28):
+                if idx < len(pts):
+                    cv2.circle(annotated_image, pts[idx], 4, (0, 200, 255), -1)
             
             # Extrair, centralizar e adicionar ao buffer
             centered_coords = process_landmarks_to_tensor(landmarks)
@@ -150,7 +160,7 @@ def main():
                 input_data = np.expand_dims(input_data, axis=0)
                 
                 if HAS_TORCH:
-                    input_tensor = torch.tensor(input_data, dtype=torch.float32).to('cuda')
+                    input_tensor = torch.tensor(input_data, dtype=torch.float32).to(device)
                 else:
                     input_tensor = input_data
                     

@@ -35,7 +35,7 @@ try:
 except ImportError:
     from Backend.logger import log_debug, log_info, log_warn, log_error, log_exception, log_sampled, get_recent_logs
 
-from camera_utils import get_usb_camera_source, is_camera_blacklisted, get_usb_camera_name, list_available_cameras
+from camera_utils import get_usb_camera_source, is_camera_blacklisted, get_usb_camera_name, list_available_cameras, open_camera
 from pose_estimation import TennisSyncEngine
 
 # Estado Global do Serviço
@@ -180,17 +180,9 @@ def video_worker():
         if HAS_CV2:
             if state.cap is None or not state.cap.isOpened():
                 try:
-                    # Tenta DirectShow primeiro para evitar exclusividade MSMF no Windows
-                    state.cap = cv2.VideoCapture(state.camera_source, cv2.CAP_DSHOW)
-                    if not state.cap.isOpened():
-                        state.cap = cv2.VideoCapture(state.camera_source)
+                    state.cap = open_camera(state.camera_source, width=640, height=480, target_fps=60)
                     if state.cap.isOpened():
-                        # Otimização para qualquer PC: define 640x480, 30 FPS e buffersize=1 para latência zero
-                        state.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                        state.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                        state.cap.set(cv2.CAP_PROP_FPS, 30)
-                        state.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        log_info("CAM/STREAM", f"Câmera OpenCV aberta com sucesso na fonte: {state.camera_source} (640x480 @ 30 FPS)")
+                        log_info("CAM/STREAM", f"Câmera Multithread aberta com sucesso na fonte: {state.camera_source} (640x480 @ até 60 FPS)")
                 except Exception as e:
                     log_sampled("cam_open_fail", 3.0, "CAM/STREAM", f"Aguardando disponibilidade da câmera {state.camera_source}...", {"erro": str(e)}, level="WARN")
                     state.cap = None
@@ -200,7 +192,7 @@ def video_worker():
                 if success and raw_frame is not None:
                     frame = raw_frame
                 else:
-                    time.sleep(0.5)
+                    time.sleep(0.01)
 
         if state.engine is not None and frame is not None:
             try:
@@ -210,14 +202,14 @@ def video_worker():
                 log_exception("CAM/STREAM", "Erro em process_frame no worker de vídeo", e)
 
         if HAS_CV2 and frame is not None:
-            # Compressão JPEG 65 otimizada: leve na rede e rápida de codificar
-            ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            # Compressão JPEG 60 otimizada: sem flags pesadas e com taxa ultra-rápida
+            ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60, int(cv2.IMWRITE_JPEG_OPTIMIZE), 0])
             if ret:
                 state.latest_jpeg = buffer.tobytes()
 
-        # Temporização adaptativa para manter exatos 30 FPS estáveis sem oscilar
+        # Temporização adaptativa para manter taxa fluida de até 60 FPS (sem travar em 30)
         elapsed = time.time() - loop_start
-        sleep_time = max(0.001, (1.0 / 30.0) - elapsed)
+        sleep_time = max(0.001, (1.0 / 60.0) - elapsed)
         time.sleep(sleep_time)
 
 @asynccontextmanager
@@ -558,12 +550,17 @@ def resume_camera():
     return {"status": "ok", "camera_paused": False, "message": "Webcam retomada"}
 
 def mjpeg_generator():
-    """Gera stream MJPEG compatível com tags <img> do navegador."""
+    """Gera stream MJPEG compatível com tags <img> do navegador em até 60 FPS fluidos."""
+    last_sent = None
     while state.is_running:
-        if state.latest_jpeg is not None:
+        current_jpeg = state.latest_jpeg
+        if current_jpeg is not None and current_jpeg is not last_sent:
+            last_sent = current_jpeg
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + state.latest_jpeg + b'\r\n')
-        time.sleep(0.04)
+                   b'Content-Type: image/jpeg\r\n\r\n' + current_jpeg + b'\r\n')
+            time.sleep(0.012)
+        else:
+            time.sleep(0.005)
 
 @app.get("/api/video_feed")
 def video_feed():
