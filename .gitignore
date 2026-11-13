@@ -1,0 +1,63 @@
+# ==============================================================================
+# TenniSync - .gitignore para Repositório Git
+# ==============================================================================
+
+# Ambientes virtuais Python
+.venv/
+**/.venv/
+venv/
+**/venv/
+env/
+**/env/
+ENV/
+**/ENV/
+
+# Dependências Node.js / Frontend
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+**/.vite/
+package-lock.json
+
+# Cache do Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Vídeos gravados em tempo de execução e replays temporários
+replays/*.mp4
+**/replays/*.mp4
+temp_data/
+**/temp_data/
+
+# Logs e arquivos de sistema
+*.log
+logs/
+**/logs/
+.DS_Store
+Thumbs.db
+
+# Configurações de IDEs
+.vscode/
+**/.vscode/
+.idea/
+**/.idea/
