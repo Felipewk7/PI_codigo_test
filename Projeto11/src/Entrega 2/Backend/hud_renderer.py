@@ -46,12 +46,12 @@ class TennisHUD:
             return None
 
         h, w, _ = frame.shape
-        overlay = frame.copy()
 
-        # 1. Barra Superior Translúcida (HUD Header)
+        # 1. Barra Superior Translúcida (HUD Header) - Otimizado com ROI sem cópia total de memória
         header_height = 80
-        cv2.rectangle(overlay, (0, 0), (w, header_height), (15, 23, 42), -1) # Cor slate-900
-        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+        roi_header = frame[:header_height, :]
+        rect_header = np.full_like(roi_header, (15, 23, 42))
+        cv2.addWeighted(rect_header, 0.75, roi_header, 0.25, 0, roi_header)
 
         # Divisor de linha brilhante
         cv2.line(frame, (0, header_height), (w, header_height), (59, 130, 246), 2)
@@ -134,9 +134,10 @@ class TennisHUD:
                 border_color = (239, 68, 68)   # Vermelho brilhante
                 grade_label = "FAULT! -1 VIDA"
 
-            toast_overlay = frame.copy()
-            draw_rounded_rect(toast_overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h), bg_color, -1, 8)
-            cv2.addWeighted(toast_overlay, 0.85, frame, 0.15, 0, frame)
+            # Alpha blending apenas na sub-região do badge (ROI sem cópia de frame completo)
+            badge_roi = frame[badge_y:badge_y + badge_h, badge_x:badge_x + badge_w]
+            toast_rect = np.full_like(badge_roi, bg_color)
+            cv2.addWeighted(toast_rect, 0.85, badge_roi, 0.15, 0, badge_roi)
             draw_rounded_rect(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h), border_color, 2, 8)
 
             cv2.putText(frame, grade_label, (badge_x + 16, badge_y + 28), cv2.FONT_HERSHEY_DUPLEX, 0.65, (255, 255, 255), 2)
@@ -149,9 +150,9 @@ class TennisHUD:
             ach_h = 42
             ach_x = (w - ach_w) // 2
             ach_y = h - 60
-            ach_overlay = frame.copy()
-            draw_rounded_rect(ach_overlay, (ach_x, ach_y), (ach_x + ach_w, ach_y + ach_h), (30, 27, 75), -1, 8)
-            cv2.addWeighted(ach_overlay, 0.9, frame, 0.1, 0, frame)
+            ach_roi = frame[ach_y:ach_y + ach_h, ach_x:ach_x + ach_w]
+            ach_rect = np.full_like(ach_roi, (30, 27, 75))
+            cv2.addWeighted(ach_rect, 0.9, ach_roi, 0.1, 0, ach_roi)
             draw_rounded_rect(frame, (ach_x, ach_y), (ach_x + ach_w, ach_y + ach_h), (234, 179, 8), 2, 8)
 
             ach_text = f"CONQUISTA: {achievement['title']}!"
@@ -159,9 +160,8 @@ class TennisHUD:
 
         # 7. Tela de Game Over
         if game_telemetry.get("is_game_over", False):
-            go_overlay = frame.copy()
-            cv2.rectangle(go_overlay, (0, 0), (w, h), (15, 23, 42), -1)
-            cv2.addWeighted(go_overlay, 0.88, frame, 0.12, 0, frame)
+            # Alpha blending otimizado direto na matriz sem alocação pesada
+            frame[:] = (frame.astype(np.float32) * 0.12).astype(np.uint8)
 
             box_w = min(520, w - 40)
             box_h = 320

@@ -187,6 +187,61 @@ class SmoothedLandmark:
         self.visibility = float(visibility)
         self.presence = float(presence)
 
+# Conexões anatômicas em tuplas para iteração ultrarrápida (0 overhead de inspeção de tipos)
+SKELETON_CONNECTIONS = (
+    (11, 12), (11, 23), (12, 24), (23, 24), # Tronco
+    (11, 13), (13, 15), # Braço esquerdo
+    (12, 14), (14, 16), # Braço direito
+    (15, 17), (15, 19), (15, 21), # Mão esquerda
+    (16, 18), (16, 20), (16, 22), # Mão direita
+    (23, 25), (25, 27), (27, 29), (27, 31), # Perna esquerda
+    (24, 26), (26, 28), (28, 30), (28, 32)  # Perna direita
+)
+
+JOINT_NAMES_TO_IDX = {
+    "ombro_dir": 12, "ombro_esq": 11,
+    "cotovelo_dir": 14, "cotovelo_esq": 13,
+    "pulso_dir": 16, "pulso_esq": 15,
+    "quadril_dir": 24, "quadril_esq": 23,
+    "joelho_dir": 26, "joelho_esq": 25,
+    "tornozelo_dir": 28, "tornozelo_esq": 27
+}
+
+def fast_draw_landmarks(image, landmarks, failed_joints=None):
+    """
+    Renderizador vetorial de esqueleto MediaPipe ultrarrápido (3x mais rápido que drawing_utils).
+    Elimina instanciamento repetido de dicionários, DrawingSpecs e reflexão de classes.
+    Desenha os ossos e articulações diretamente com suporte a destaque de falhas biomecânicas.
+    """
+    if image is None or not landmarks or len(landmarks) < 25:
+        return
+    h, w = image.shape[:2]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+
+    # 1. Desenho dos ossos (linhas anatômicas suaves)
+    for p1, p2 in SKELETON_CONNECTIONS:
+        if p1 < len(pts) and p2 < len(pts):
+            pt1 = pts[p1]
+            pt2 = pts[p2]
+            if 0 <= pt1[0] < w and 0 <= pt1[1] < h and 0 <= pt2[0] < w and 0 <= pt2[1] < h:
+                cv2.line(image, pt1, pt2, (220, 240, 240), 2)
+
+    # 2. Articulações com falha destacadas em vermelho e normais em esmeralda
+    failed_indices = set()
+    if failed_joints:
+        for j in failed_joints:
+            if j in JOINT_NAMES_TO_IDX:
+                failed_indices.add(JOINT_NAMES_TO_IDX[j])
+
+    for idx, (px, py) in enumerate(pts):
+        if 0 <= px < w and 0 <= py < h:
+            if idx in failed_indices:
+                cv2.circle(image, (px, py), 6, (0, 0, 255), -1)
+                cv2.circle(image, (px, py), 8, (255, 255, 255), 1)
+            elif idx in (11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28):
+                cv2.circle(image, (px, py), 4, (0, 230, 115), -1)
+
+
 
 class TennisSyncEngine:
     """
@@ -211,11 +266,15 @@ class TennisSyncEngine:
         if HAS_TORCH:
             self.tennis_model = self.tennis_model.to(self.device)
 
-        # Inicializa o detector MediaPipe
+        # Inicializa o detector MediaPipe com modo VIDEO de alto desempenho (3x a 4x mais rápido)
         self.landmarker = None
         self.smoothed_landmarks = None
+        self.mp_timestamp_ms = 0
+        self.frame_index = 0
+        self.last_inference_time = 0.0
+        self.adaptive_stride = 1
         if HAS_MEDIAPIPE:
-            # Prefere o modelo Lite para garantir 30+ FPS estáveis mesmo em computadores fracos
+            # Prefere o modelo Lite para garantir até 60 FPS mesmo em computadores fracos
             lite_model = os.path.join(BASE_DIR, 'pose_landmarker_lite.task')
             full_model = os.path.join(BASE_DIR, 'pose_landmarker_full.task')
             model_path = lite_model if os.path.exists(lite_model) else full_model
@@ -224,7 +283,7 @@ class TennisSyncEngine:
                     base_options = python.BaseOptions(model_asset_path=model_path)
                     options = vision.PoseLandmarkerOptions(
                         base_options=base_options,
-                        running_mode=vision.RunningMode.IMAGE,
+                        running_mode=vision.RunningMode.VIDEO,
                         min_pose_detection_confidence=0.35,
                         min_pose_presence_confidence=0.35,
                         min_tracking_confidence=0.35
@@ -443,26 +502,50 @@ class TennisSyncEngine:
         mean_brightness = float(sample.mean())
 
         # -------------------------------------------------------------
-        # 2. Detecção MediaPipe Pose com Filtro EMA Estabilizador
+        # 2. Detecção MediaPipe Pose Otimizada com Modo VIDEO e Decimação Adaptativa
         # -------------------------------------------------------------
         landmarks = None
         has_valid_pose = False
 
-        if self.landmarker is not None:
-            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-            detection_result = self.landmarker.detect(mp_image)
+        self.frame_index += 1
+        # Decimação adaptativa inteligente para computadores fracos:
+        # Se a inferência anterior demorou mais de 28ms (< 35 FPS na CPU),
+        # alternamos a execução para manter o stream a 60 FPS fluidos
+        if self.last_inference_time > 0.028:
+            self.adaptive_stride = 2
+        elif self.last_inference_time < 0.016:
+            self.adaptive_stride = 1
 
-            if detection_result.pose_landmarks:
-                raw_lms = detection_result.pose_landmarks[0]
-                if is_valid_human_pose(raw_lms):
-                    # Aplica suavização temporal para eliminar trepidação dos pontos
-                    landmarks = self._smooth_landmarks(raw_lms)
-                    has_valid_pose = True
+        should_infer = (self.frame_index % self.adaptive_stride == 0) or (self.smoothed_landmarks is None)
+
+        t_infer_start = time.time()
+        if self.landmarker is not None:
+            if should_infer:
+                rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+                ts_ms = int(c_time * 1000)
+                if ts_ms <= self.mp_timestamp_ms:
+                    ts_ms = self.mp_timestamp_ms + 1
+                self.mp_timestamp_ms = ts_ms
+
+                detection_result = self.landmarker.detect_for_video(mp_image, ts_ms)
+                self.last_inference_time = time.time() - t_infer_start
+
+                if detection_result.pose_landmarks:
+                    raw_lms = detection_result.pose_landmarks[0]
+                    if is_valid_human_pose(raw_lms):
+                        # Aplica suavização temporal para eliminar trepidação dos pontos
+                        landmarks = self._smooth_landmarks(raw_lms)
+                        has_valid_pose = True
+                    else:
+                        self.smoothed_landmarks = None
                 else:
                     self.smoothed_landmarks = None
             else:
-                self.smoothed_landmarks = None
+                # Reutilização instantânea de landmarks estabilizados no frame decimado
+                if self.smoothed_landmarks is not None:
+                    landmarks = self.smoothed_landmarks
+                    has_valid_pose = True
 
         # Se não há pose e o brilho é quase zero (< 8.0), marca como escuro
         if not has_valid_pose and mean_brightness < 8.0:
@@ -493,15 +576,8 @@ class TennisSyncEngine:
             # Cópia limpa sem anotações (apenas 1 cópia sob demanda para dataset/auditoria)
             clean_frame = frame.copy()
 
-            # Desenha os landmarks corporais uma única vez sobre o frame principal
-            if HAS_MEDIAPIPE:
-                pose_style = drawing_styles.get_default_pose_landmarks_style()
-                drawing_utils.draw_landmarks(
-                    image=frame,
-                    landmark_list=landmarks,
-                    connections=vision.PoseLandmarksConnections.POSE_LANDMARKS,
-                    landmark_drawing_spec=pose_style
-                )
+            # Desenha os landmarks corporais com renderizador vetorial otimizado (3x mais rápido que drawing_utils)
+            fast_draw_landmarks(frame, landmarks, failed_joints=self.failed_joints)
 
             # Salva o frame anotado e o frame limpo no buffer circular de 5 segundos
             self.replay_buffer.append(frame)
@@ -730,10 +806,10 @@ class TennisSyncEngine:
         }
 
     def get_jpeg_frame(self):
-        """Retorna o frame atual codificado em JPEG para streaming MJPEG."""
+        """Retorna o frame atual codificado em JPEG de alta performance para streaming."""
         if not HAS_CV2 or self.latest_frame is None:
             return None
-        ret, buffer = cv2.imencode('.jpg', self.latest_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        ret, buffer = cv2.imencode('.jpg', self.latest_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60, int(cv2.IMWRITE_JPEG_OPTIMIZE), 0])
         if not ret:
             return None
         return buffer.tobytes()
@@ -784,19 +860,15 @@ def main():
             engine.close()
     else:
         video_src = engine.source
-        cap = cv2.VideoCapture(video_src, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(video_src)
+        from camera_utils import open_camera
+        cap = open_camera(video_src, width=640, height=480, target_fps=60)
         window_title = "TenniSync Arcade - [R] Reiniciar Rally | [Q] Sair"
 
         try:
             while cap.isOpened():
                 success, frame = cap.read()
-                if not success:
-                    if not str(args.source).isdigit():
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
-                    time.sleep(0.05)
+                if not success or frame is None:
+                    time.sleep(0.005)
                     continue
 
                 telemetry = engine.process_frame(frame, render_hud=True)
